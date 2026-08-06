@@ -1,0 +1,13 @@
+{
+  "name": "holdem-sangriento-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check poker_engine.js",
+    "test": "node --test poker_engine.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": { "ws": "^8.18.3" }
+}
