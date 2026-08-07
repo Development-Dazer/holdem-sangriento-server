@@ -3,7 +3,10 @@ services:
     name: holdem-sangriento-server
     runtime: node
     plan: free
+    autoDeploy: true
     buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /health
-
+    envVars:
+      - key: NODE_ENV
+        value: production
