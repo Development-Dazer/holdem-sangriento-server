@@ -1,11 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PokerEngine, evaluate, calculateSidePots } from "./poker_engine.js";
+import { PokerEngine, evaluate, calculateSidePots, EVENT_DEFINITIONS } from "./poker_engine.js";
 
 const players = (count = 4) => Array.from({ length: count }, (_, index) => ({
-  id: `p${index}`, name: `Jugador ${index + 1}`, character: ["El Tramposo", "El Contador", "El Psicólogo", "El Médico"][index]
+  id: `p${index}`, name: `Jugador ${index + 1}`, character: ["El Tramposo", "El Contador", "El Psicólogo", "El Ladrón"][index]
 }));
 const card = (rank, suit) => ({ rank, suit });
+
+function finishForSeat(engine, winnerSeat = 0) {
+  for (const player of engine.players) player.folded = player.seat !== winnerSeat;
+  engine.finishByFold();
+}
 
 test("reparte 52 cartas únicas sin exponer cartas privadas", () => {
   const engine = new PokerEngine(players(), { randomInt: () => 0 });
@@ -84,4 +89,77 @@ test("distribuye correctamente pozo principal y lateral", () => {
   engine.players[3].folded = true;
   const payouts = calculateSidePots(engine.players, [0, 1, 2], engine.community);
   assert.deepEqual(payouts, { 0: 200, 1: 150, 2: 0 });
+});
+
+test("aplica eventos autoritativos cada tres manos", () => {
+  const eventIndex = EVENT_DEFINITIONS.findIndex((event) => event.name === "MANO OBLIGATORIA");
+  const engine = new PokerEngine(players(), { randomInt: (maximum) => maximum === EVENT_DEFINITIONS.length ? eventIndex : 0 });
+  engine.startHand();
+  finishForSeat(engine);
+  engine.startHand();
+  finishForSeat(engine);
+  engine.startHand();
+  assert.equal(engine.eventName, "MANO OBLIGATORIA");
+  assert.equal(engine.legalActions(engine.turnSeat).includes("fold"), false);
+  assert.throws(() => engine.startHand(), /activa/);
+});
+
+test("corte de luz oculta la mesa solo en la vista privada", () => {
+  const engine = new PokerEngine(players(), { randomInt: () => 0 });
+  engine.startHand(); finishForSeat(engine);
+  engine.startHand(); finishForSeat(engine);
+  engine.startHand();
+  engine.community = [card(2, "S"), card(3, "H"), card(4, "D")];
+  engine.street = "flop";
+  assert.equal(engine.publicState().community.length, 3);
+  assert.deepEqual(engine.privateState("p0").community, []);
+  assert.equal(engine.privateState("p0").communityCount, 3);
+});
+
+test("habilidades informativas no filtran cartas privadas", () => {
+  const engine = new PokerEngine(players(), { randomInt: () => 0 });
+  engine.startHand();
+  engine.turnSeat = 0;
+  const result = engine.useAbility("p0");
+  assert.match(result.message, /river será/);
+  assert.ok(engine.privateState("p0").previewCard);
+  assert.equal(engine.privateState("p1").previewCard, null);
+  assert.equal("previewCard" in engine.publicState().players[0], false);
+
+  engine.turnSeat = 1;
+  assert.match(engine.useAbility("p1").message, /cartas J/);
+  engine.turnSeat = 2;
+  assert.match(engine.useAbility("p2", 0).message, /por delante|parejas|igualadas/);
+});
+
+test("Favor cambia una carta sin duplicar el mazo y expone solo al comprador", () => {
+  const engine = new PokerEngine(players(), { randomInt: () => 0 });
+  engine.startHand();
+  engine.turnSeat = 0;
+  engine.players[0].favor = 9;
+  const oldCard = engine.players[0].cards[0];
+  engine.useFavor("p0", "reroll", -1, 0);
+  assert.notDeepEqual(engine.players[0].cards[0], oldCard);
+  const allCards = [...engine.deck, ...engine.players.flatMap((player) => player.cards)];
+  assert.equal(allCards.length, 52);
+  assert.equal(new Set(allCards.map((entry) => `${entry.rank}${entry.suit}`)).size, 52);
+
+  engine.players[0].favorUsed = false;
+  engine.useFavor("p0", "expose", 1, -1);
+  assert.equal(engine.privateState("p0").exposedCard.seat, 1);
+  assert.equal(engine.privateState("p1").exposedCard, null);
+  assert.equal("exposedCard" in engine.publicState().players[0], false);
+  const action = engine.legalActions(0)[0];
+  engine.act("p0", action);
+  assert.equal(engine.privateState("p0").exposedCard, null);
+});
+
+test("Prestamista comienza con adelanto y deuda exigible", () => {
+  const roster = players(2);
+  roster[0].character = "El Prestamista";
+  const engine = new PokerEngine(roster, { randomInt: () => 0 });
+  assert.equal(engine.players[0].chips, 550);
+  assert.equal(engine.players[0].debt, 65);
+  engine.startHand();
+  assert.throws(() => engine.useAbility("p0"), /debes|deuda/i);
 });

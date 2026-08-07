@@ -1,6 +1,6 @@
 {
   "name": "holdem-sangriento-server",
-  "version": "0.1.0",
+  "version": "2.2.0",
   "description": "Servidor WebSocket autoritativo para las partidas online de Hold'em Sangriento.",
   "private": true,
   "author": "Development Dazer",
@@ -8,7 +8,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check poker_engine.js",
+    "check": "node --check server.js && node --check poker_engine.js && node --check leaderboard.js",
     "test": "node --test *.test.js"
   },
   "engines": { "node": ">=20" },

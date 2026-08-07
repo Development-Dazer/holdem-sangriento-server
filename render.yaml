@@ -10,3 +10,7 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: LEADERBOARD_SEASON
+        value: preseason-1
+      - key: RELEASE_VERSION
+        value: 2.2.0

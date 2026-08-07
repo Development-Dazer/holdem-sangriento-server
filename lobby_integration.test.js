@@ -21,7 +21,7 @@ function waitFor(socket, expectedType) {
 }
 
 function send(socket, type, payload = {}) {
-  socket.send(JSON.stringify({ v: 1, type, payload }));
+  socket.send(JSON.stringify({ v: 2, type, payload }));
 }
 
 async function connect() {
@@ -36,7 +36,7 @@ async function connect() {
 }
 
 test("navega salas, protege contraseña y solo el host inicia", async (context) => {
-  const server = spawn(process.execPath, ["server.js"], { cwd: process.cwd(), env: { ...process.env, PORT: String(PORT) } });
+  const server = spawn(process.execPath, ["server.js"], { cwd: process.cwd(), env: { ...process.env, PORT: String(PORT), LEADERBOARD_FILE: "" } });
   context.after(() => server.kill());
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("El servidor no inició")), 3000);
@@ -45,6 +45,14 @@ test("navega salas, protege contraseña y solo el host inicia", async (context) 
     });
     server.once("error", reject);
   });
+
+  const leaderboardResponse = await fetch(`http://127.0.0.1:${PORT}/leaderboard?limit=10`);
+  assert.equal(leaderboardResponse.status, 200);
+  assert.equal(leaderboardResponse.headers.get("access-control-allow-origin"), "*");
+  const initialLeaderboard = await leaderboardResponse.json();
+  assert.equal(initialLeaderboard.mode, "preseason");
+  assert.equal(initialLeaderboard.season, "preseason-1");
+  assert.deepEqual(initialLeaderboard.entries, []);
 
   const host = await connect();
   const guest = await connect();
@@ -56,6 +64,8 @@ test("navega salas, protege contraseña y solo el host inicia", async (context) 
   const joined = await joinedPromise;
   const hostState = await hostStatePromise;
   assert.equal(hostState.hostPlayerId, hostState.players[0].id);
+  assert.equal(typeof joined.reconnectToken, "string");
+  assert.ok(joined.reconnectToken.length >= 24);
 
   send(guest, "list_rooms");
   const directory = await waitFor(guest, "room_list");
@@ -68,7 +78,7 @@ test("navega salas, protege contraseña y solo el host inicia", async (context) 
   const guestJoined = waitFor(guest, "room_joined");
   const guestState = waitFor(guest, "room_state");
   send(guest, "join_room", { code: joined.code, name: "Invitado", character: "El Contador", password: "mate" });
-  await guestJoined;
+  const guestSession = await guestJoined;
   await guestState;
 
   send(guest, "start_game");
@@ -78,4 +88,31 @@ test("navega salas, protege contraseña y solo el host inicia", async (context) 
   const game = await gameState;
   assert.equal(game.yourCards.length, 2);
   assert.equal(game.players.length, 2);
+
+  const acceptedAbility = waitFor(host, "action_accepted");
+  const privateHostState = waitFor(host, "game_state");
+  const privateGuestState = waitFor(guest, "game_state");
+  send(host, "ability");
+  assert.equal((await acceptedAbility).action, "ability");
+  assert.ok((await privateHostState).previewCard);
+  assert.equal((await privateGuestState).previewCard, null);
+
+  const pausedState = waitFor(host, "room_state");
+  guest.close();
+  assert.equal((await pausedState).phase, "paused_disconnect");
+  const impostor = await connect();
+  context.after(() => impostor.close());
+  send(impostor, "join_room", { code: joined.code, name: "Invitado", character: "El Contador", password: "mate" });
+  assert.match((await waitFor(impostor, "error")).message, /verificar/);
+  impostor.close();
+
+  const reconnected = await connect();
+  context.after(() => reconnected.close());
+  const recoveredSeat = waitFor(reconnected, "room_joined");
+  const recoveredRoom = waitFor(reconnected, "room_state");
+  const recoveredGame = waitFor(reconnected, "game_state");
+  send(reconnected, "join_room", { code: joined.code, name: "Invitado", character: "El Contador", password: "mate", reconnectToken: guestSession.reconnectToken });
+  assert.equal((await recoveredSeat).reconnected, true);
+  assert.equal((await recoveredRoom).phase, "playing");
+  assert.equal((await recoveredGame).yourCards.length, 2);
 });
