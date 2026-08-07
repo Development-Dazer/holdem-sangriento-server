@@ -36,9 +36,48 @@ function roomCode() {
   return code;
 }
 
+function cleanRoomName(value) {
+  return String(value || "SALA DE PÓKER").replace(/[\r\n<>\[\]]/g, "").trim().slice(0, 28) || "SALA DE PÓKER";
+}
+
+function passwordDigest(value) {
+  return crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex");
+}
+
+function roomDirectoryEntry(room) {
+  return {
+    code: room.code,
+    name: room.name,
+    locked: room.passwordHash !== "",
+    players: room.players.filter((player) => player.connected).length,
+    maxPlayers: MAX_PLAYERS,
+    phase: room.phase
+  };
+}
+
+function roomDirectory() {
+  return [...rooms.values()]
+    .filter((room) => room.listed && room.phase === "lobby")
+    .map(roomDirectoryEntry)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function sendRoomList(socket) {
+  send(socket, "room_list", { rooms: roomDirectory() });
+}
+
+function broadcastRoomList() {
+  const payload = { rooms: roomDirectory() };
+  for (const socket of wss.clients) send(socket, "room_list", payload);
+}
+
 function publicRoom(room) {
   return {
     code: room.code,
+    name: room.name,
+    locked: room.passwordHash !== "",
+    listed: room.listed,
+    hostPlayerId: room.hostPlayerId,
     phase: room.phase,
     turnPlayerId: room.turnPlayerId,
     players: room.players.map(({ id, name, character, ready, connected }) => ({ id, name, character, ready, connected }))
@@ -63,12 +102,19 @@ function leaveRoom(client) {
   const player = room.players.find((entry) => entry.id === client.id);
   if (player) player.connected = false;
   if (room.players.every((entry) => !entry.connected)) rooms.delete(room.code);
-  else broadcastRoom(room);
+  else {
+    if (room.hostPlayerId === client.id) {
+      room.hostPlayerId = room.players.find((entry) => entry.connected)?.id || "";
+    }
+    broadcastRoom(room);
+  }
+  broadcastRoomList();
 }
 
 function addPlayer(socket, client, room, payload) {
   if (room.phase !== "lobby") throw new Error("La partida ya comenzó.");
   if (room.players.length >= MAX_PLAYERS) throw new Error("La sala está completa.");
+  if (room.passwordHash !== "" && passwordDigest(payload.password) !== room.passwordHash) throw new Error("Contraseña incorrecta.");
   const character = String(payload.character || "");
   if (!CHARACTERS.has(character)) throw new Error("Personaje inválido.");
   if (room.players.some((player) => player.character === character)) throw new Error("Ese personaje ya fue elegido.");
@@ -77,6 +123,7 @@ function addPlayer(socket, client, room, payload) {
   client.roomCode = room.code;
   send(socket, "room_joined", { playerId: client.id, code: room.code });
   broadcastRoom(room);
+  broadcastRoomList();
 }
 
 wss.on("connection", (socket) => {
@@ -89,10 +136,22 @@ wss.on("connection", (socket) => {
       if (message.v !== VERSION || typeof message.type !== "string") throw new Error("Versión de protocolo inválida.");
       const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
       if (message.type === "ping") return send(socket, "pong", { at: Date.now() });
+      if (message.type === "list_rooms") return sendRoomList(socket);
       if (message.type === "create_room") {
         if (client.roomCode) throw new Error("Ya perteneces a una sala.");
         const code = roomCode();
-        const room = { code, phase: "lobby", turnPlayerId: "", players: [], engine: null };
+        const password = String(payload.password || "").slice(0, 32);
+        const room = {
+          code,
+          name: cleanRoomName(payload.roomName),
+          listed: payload.listed !== false,
+          passwordHash: password === "" ? "" : passwordDigest(password),
+          hostPlayerId: client.id,
+          phase: "lobby",
+          turnPlayerId: "",
+          players: [],
+          engine: null
+        };
         rooms.set(code, room);
         return addPlayer(socket, client, room, payload);
       }
@@ -108,12 +167,29 @@ wss.on("connection", (socket) => {
       if (!player) throw new Error("Jugador no registrado.");
       if (message.type === "ready") {
         player.ready = Boolean(payload.value);
-        if (room.players.length >= 2 && room.players.every((entry) => entry.ready)) {
-          room.engine = new PokerEngine(room.players);
-          room.engine.startHand();
-          room.phase = "playing";
-          room.turnPlayerId = room.engine.players[room.engine.turnSeat]?.id || "";
-        }
+        broadcastRoom(room);
+        return;
+      }
+      if (message.type === "start_game") {
+        if (room.hostPlayerId !== client.id) throw new Error("Solo el anfitrión puede iniciar la partida.");
+        if (room.phase !== "lobby") throw new Error("La partida ya comenzó.");
+        const connectedPlayers = room.players.filter((entry) => entry.connected);
+        if (connectedPlayers.length < 2) throw new Error("Se necesitan al menos 2 jugadores.");
+        room.players = connectedPlayers;
+        room.engine = new PokerEngine(room.players);
+        room.engine.startHand();
+        room.phase = "playing";
+        room.turnPlayerId = room.engine.players[room.engine.turnSeat]?.id || "";
+        broadcastRoom(room);
+        broadcastRoomList();
+        return broadcastGame(room);
+      }
+      if (message.type === "next_hand") {
+        if (room.hostPlayerId !== client.id) throw new Error("Solo el anfitrión puede repartir la siguiente mano.");
+        if (room.phase !== "hand_complete" || !room.engine) throw new Error("La mano actual todavía no terminó.");
+        room.engine.startHand();
+        room.phase = "playing";
+        room.turnPlayerId = room.engine.players[room.engine.turnSeat]?.id || "";
         broadcastRoom(room);
         return broadcastGame(room);
       }
