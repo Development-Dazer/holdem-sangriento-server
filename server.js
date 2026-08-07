@@ -78,6 +78,7 @@ function publicRoom(room) {
     locked: room.passwordHash !== "",
     listed: room.listed,
     hostPlayerId: room.hostPlayerId,
+    rematchVotes: [...(room.rematchVotes || [])],
     phase: room.phase,
     turnPlayerId: room.turnPlayerId,
     players: room.players.map(({ id, name, character, ready, connected }) => ({ id, name, character, ready, connected }))
@@ -150,7 +151,8 @@ wss.on("connection", (socket) => {
           phase: "lobby",
           turnPlayerId: "",
           players: [],
-          engine: null
+          engine: null,
+          rematchVotes: new Set()
         };
         rooms.set(code, room);
         return addPlayer(socket, client, room, payload);
@@ -187,11 +189,34 @@ wss.on("connection", (socket) => {
       if (message.type === "next_hand") {
         if (room.hostPlayerId !== client.id) throw new Error("Solo el anfitrión puede repartir la siguiente mano.");
         if (room.phase !== "hand_complete" || !room.engine) throw new Error("La mano actual todavía no terminó.");
+        if (room.engine.livingSeats().length < 2) throw new Error("La partida terminó. Propón una revancha.");
         room.engine.startHand();
         room.phase = "playing";
         room.turnPlayerId = room.engine.players[room.engine.turnSeat]?.id || "";
         broadcastRoom(room);
         return broadcastGame(room);
+      }
+      if (message.type === "propose_rematch") {
+        if (room.hostPlayerId !== client.id) throw new Error("Solo el anfitrión puede proponer una revancha.");
+        if (room.phase !== "hand_complete" || !room.engine || room.engine.livingSeats().length >= 2) throw new Error("La partida actual todavía puede continuar.");
+        room.phase = "rematch";
+        room.rematchVotes = new Set([client.id]);
+        return broadcastRoom(room);
+      }
+      if (message.type === "accept_rematch") {
+        if (room.phase !== "rematch") throw new Error("No hay una revancha propuesta.");
+        room.rematchVotes.add(client.id);
+        const connectedIds = room.players.filter((entry) => entry.connected).map((entry) => entry.id);
+        if (connectedIds.length >= 2 && connectedIds.every((id) => room.rematchVotes.has(id))) {
+          room.engine = new PokerEngine(room.players);
+          room.engine.startHand();
+          room.phase = "playing";
+          room.rematchVotes.clear();
+          room.turnPlayerId = room.engine.players[room.engine.turnSeat]?.id || "";
+          broadcastRoom(room);
+          return broadcastGame(room);
+        }
+        return broadcastRoom(room);
       }
       if (message.type === "action") {
         if (room.phase !== "playing" || !room.engine) throw new Error("La partida no está activa.");
