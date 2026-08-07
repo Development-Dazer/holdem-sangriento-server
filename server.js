@@ -79,6 +79,7 @@ function publicRoom(room) {
     listed: room.listed,
     hostPlayerId: room.hostPlayerId,
     rematchVotes: [...(room.rematchVotes || [])],
+    disconnectedPlayerId: room.disconnectedPlayerId || "",
     phase: room.phase,
     turnPlayerId: room.turnPlayerId,
     players: room.players.map(({ id, name, character, ready, connected }) => ({ id, name, character, ready, connected }))
@@ -102,6 +103,11 @@ function leaveRoom(client) {
   if (!room) return;
   const player = room.players.find((entry) => entry.id === client.id);
   if (player) player.connected = false;
+  if (player && room.phase === "playing") {
+    room.previousPhase = "playing";
+    room.phase = "paused_disconnect";
+    room.disconnectedPlayerId = player.id;
+  }
   if (room.players.every((entry) => !entry.connected)) rooms.delete(room.code);
   else {
     if (room.hostPlayerId === client.id) {
@@ -113,13 +119,31 @@ function leaveRoom(client) {
 }
 
 function addPlayer(socket, client, room, payload) {
-  if (room.phase !== "lobby") throw new Error("La partida ya comenzó.");
-  if (room.players.length >= MAX_PLAYERS) throw new Error("La sala está completa.");
   if (room.passwordHash !== "" && passwordDigest(payload.password) !== room.passwordHash) throw new Error("Contraseña incorrecta.");
   const character = String(payload.character || "");
   if (!CHARACTERS.has(character)) throw new Error("Personaje inválido.");
+  const requestedName = cleanName(payload.name);
+  if (room.phase === "paused_disconnect") {
+    const returning = room.players.find((entry) => !entry.connected && entry.name === requestedName && entry.character === character);
+    if (!returning) throw new Error("La partida está pausada; solo puede volver el jugador desconectado.");
+    client.id = returning.id;
+    client.roomCode = room.code;
+    returning.socket = socket;
+    returning.connected = true;
+    send(socket, "room_joined", { playerId: returning.id, code: room.code, reconnected: true });
+    if (room.players.every((entry) => entry.connected)) {
+      room.phase = room.previousPhase || "playing";
+      room.disconnectedPlayerId = "";
+    }
+    broadcastRoom(room);
+    broadcastGame(room);
+    broadcastRoomList();
+    return;
+  }
+  if (room.phase !== "lobby") throw new Error("La partida ya comenzó.");
+  if (room.players.length >= MAX_PLAYERS) throw new Error("La sala está completa.");
   if (room.players.some((player) => player.character === character)) throw new Error("Ese personaje ya fue elegido.");
-  const player = { id: client.id, name: cleanName(payload.name), character, ready: false, connected: true, socket };
+  const player = { id: client.id, name: requestedName, character, ready: false, connected: true, socket };
   room.players.push(player);
   client.roomCode = room.code;
   send(socket, "room_joined", { playerId: client.id, code: room.code });
@@ -152,7 +176,9 @@ wss.on("connection", (socket) => {
           turnPlayerId: "",
           players: [],
           engine: null,
-          rematchVotes: new Set()
+          rematchVotes: new Set(),
+          previousPhase: "",
+          disconnectedPlayerId: ""
         };
         rooms.set(code, room);
         return addPlayer(socket, client, room, payload);
@@ -171,6 +197,29 @@ wss.on("connection", (socket) => {
         player.ready = Boolean(payload.value);
         broadcastRoom(room);
         return;
+      }
+      if (message.type === "end_due_disconnect") {
+        if (room.hostPlayerId !== client.id) throw new Error("Solo el anfitrión puede finalizar por desconexión.");
+        if (room.phase !== "paused_disconnect" || !room.engine) throw new Error("La partida no está pausada por desconexión.");
+        const connected = room.engine.players.filter((enginePlayer) => room.players.find((entry) => entry.id === enginePlayer.id)?.connected);
+        if (connected.length === 0) throw new Error("No quedan jugadores conectados.");
+        connected.sort((a, b) => b.chips - a.chips);
+        const winner = connected[0];
+        const totalChips = room.engine.players.reduce((sum, entry) => sum + entry.chips, 0) + room.engine.pot;
+        for (const enginePlayer of room.engine.players) {
+          enginePlayer.chips = enginePlayer.id === winner.id ? totalChips : 0;
+          enginePlayer.eliminated = enginePlayer.id !== winner.id;
+          enginePlayer.folded = enginePlayer.id !== winner.id;
+        }
+        room.engine.pot = 0;
+        room.engine.handComplete = true;
+        room.engine.street = "showdown";
+        room.engine.turnSeat = -1;
+        room.engine.lastResult = { reason: "disconnect", winners: [winner.seat], payouts: { [winner.seat]: totalChips } };
+        room.phase = "hand_complete";
+        room.disconnectedPlayerId = "";
+        broadcastRoom(room);
+        return broadcastGame(room);
       }
       if (message.type === "start_game") {
         if (room.hostPlayerId !== client.id) throw new Error("Solo el anfitrión puede iniciar la partida.");
